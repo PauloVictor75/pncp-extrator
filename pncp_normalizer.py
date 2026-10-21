@@ -5,8 +5,9 @@
 Transforma os objetos JSON aninhados da API PNCP em dicionários
 "planos" (flat) prontos para escrever em CSV / inserir em banco.
 
+Os nomes dos campos da API foram conferidos em respostas reais (tests/fixtures/).
 Cada linha do CSV final representa:
-  → 1 resultado de proposta (vencedor de item)
+  → 1 resultado registrado para 1 item de 1 contratação
   → com todos os campos da contratação pai, do item e do resultado
 """
 
@@ -52,20 +53,18 @@ def _i(obj: dict, *keys) -> Optional[int]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def normalizar_contratacao(contratacao: dict) -> dict:
-    """
-    Extrai os campos relevantes do objeto contratação retornado pela API
-    /v1/contratacoes/publicacao ou /v1/orgaos/{cnpj}/compras/{ano}/{seq}
-    """
-    orgao      = contratacao.get("orgaoEntidade") or {}
-    unidade    = contratacao.get("unidadeOrgao") or {}
-    orgao_sub  = contratacao.get("orgaoSubRogado") or {}
-    unid_sub   = contratacao.get("unidadeSubRogada") or {}
+    """Campos da contratação (GET /v1/contratacoes/publicacao)."""
+    orgao     = contratacao.get("orgaoEntidade") or {}
+    unidade   = contratacao.get("unidadeOrgao") or {}
+    orgao_sub = contratacao.get("orgaoSubRogado") or {}
+    unid_sub  = contratacao.get("unidadeSubRogada") or {}
 
     return {
         # Identificação da compra
         "numeroControlePNCP":             _s(contratacao, "numeroControlePNCP"),
         "anoCompra":                      _i(contratacao, "anoCompra"),
         "sequencialCompra":               _i(contratacao, "sequencialCompra"),
+        "numeroCompra":                   _s(contratacao, "numeroCompra"),
         "processo":                       _s(contratacao, "processo"),
 
         # Órgão comprador
@@ -94,7 +93,7 @@ def normalizar_contratacao(contratacao: dict) -> dict:
         "tipoInstrumentoConvocatorioNom": _s(contratacao, "tipoInstrumentoConvocatorioNome"),
         "srp":                            _s(contratacao, "srp"),        # Sistema de Registro de Preços
 
-        # Situação atual
+        # Situação no momento da publicação (não é a situação atual)
         "situacaoCompraId":               _i(contratacao, "situacaoCompraId"),
         "situacaoCompraNome":             _s(contratacao, "situacaoCompraNome"),
 
@@ -118,116 +117,70 @@ def normalizar_contratacao(contratacao: dict) -> dict:
 
 
 def normalizar_item(item: dict) -> dict:
-    """
-    Extrai os campos relevantes de cada item de uma compra.
-    Com fallback automático para marca/modelo via descrição.
-    """
-
-    descricao = _s(item, "descricao", default="")
-
-    # 🔹 Dados vindos da API
-    marca_api = _s(item, "marcaFabricante")
-    modelo_api = _s(item, "modeloVersao")
-
-    marca = marca_api or ""
-    modelo = modelo_api or ""
-
-    # 🔥 Fallback (se API não trouxe)
-    if not marca or not modelo:
-        d = descricao.lower()
-
-        # marcas comuns
-        if "dell" in d:
-            marca = marca or "Dell"
-        elif "hp" in d:
-            marca = marca or "HP"
-        elif "lenovo" in d:
-            marca = marca or "Lenovo"
-        elif "asus" in d:
-            marca = marca or "Asus"
-        elif "acer" in d:
-            marca = marca or "Acer"
-
-        # modelos comuns
-        if "inspiron" in d:
-            modelo = modelo or "Inspiron"
-        elif "thinkpad" in d:
-            modelo = modelo or "ThinkPad"
-        elif "elitebook" in d:
-            modelo = modelo or "EliteBook"
-        elif "aspire" in d:
-            modelo = modelo or "Aspire"
-
+    """Campos de um item (GET .../compras/{ano}/{seq}/itens)."""
     return {
         "item_numero":                    _i(item, "numeroItem"),
-        "item_descricao":                 descricao,
+        "item_descricao":                 _s(item, "descricao"),
         "item_materialServico":           _s(item, "materialOuServico"),
         "item_materialServicoNome":       _s(item, "materialOuServicoNome"),
+        "item_categoriaNome":             _s(item, "itemCategoriaNome"),
         "item_tipoBeneficio":             _s(item, "tipoBeneficio"),
         "item_tipoBeneficioNome":         _s(item, "tipoBeneficioNome"),
-        "item_situacaoCodigo":            _i(item, "situacaoCompraItemCodigo"),
+        "item_situacaoCodigo":            _i(item, "situacaoCompraItem"),
         "item_situacaoNome":              _s(item, "situacaoCompraItemNome"),
-        "item_criterioJulgamentoCodigo":  _i(item, "criterioJulgamentoCodigo"),
+        "item_criterioJulgamentoCodigo":  _i(item, "criterioJulgamentoId"),
         "item_criterioJulgamentoNome":    _s(item, "criterioJulgamentoNome"),
         "item_quantidade":                _f(item, "quantidade"),
         "item_unidadeMedida":             _s(item, "unidadeMedida"),
         "item_valorUnitarioEstimado":     _f(item, "valorUnitarioEstimado"),
-        "item_valorTotalEstimado":        _f(item, "valorTotalEstimado"),
+        "item_valorTotalEstimado":        _f(item, "valorTotal"),
         "item_orcamentoSigiloso":         _s(item, "orcamentoSigiloso"),
-        "item_ncmNbs":                    _s(item, "ncmNbs"),
-        "item_codigoCatalogoCodigo":      _s(item, "codigoCatalogoCodigo"),
-        "item_codigoCatalogoNome":        _s(item, "codigoCatalogoNome"),
-
-        # 🔥 RESULTADO FINAL (melhorado)
-        "item_marca":                     marca,
-        "item_modelo":                    modelo,
+        "item_ncmNbsCodigo":              _s(item, "ncmNbsCodigo"),
+        "item_ncmNbsDescricao":           _s(item, "ncmNbsDescricao"),
+        "item_catalogoCodigo":            _s(item, "catalogoCodigoItem"),
+        "item_catalogo":                  _s(item, "catalogo"),
     }
 
 
-
 def normalizar_resultado(resultado: dict) -> dict:
-    """
-    Extrai os campos relevantes de cada resultado (proposta vencedora) de um item.
-    """
-    fornecedor = resultado.get("fornecedor") or {}
-    pais       = resultado.get("paisFornecedor") or {}
-
+    """Campos de um resultado (GET .../itens/{numeroItem}/resultados)."""
     return {
         "resultado_sequencial":           _i(resultado, "sequencialResultado"),
-        "resultado_situacaoCodigo":       _i(resultado, "situacaoCompraItemResultadoCodigo"),
+        "resultado_situacaoCodigo":       _i(resultado, "situacaoCompraItemResultadoId"),
         "resultado_situacaoNome":         _s(resultado, "situacaoCompraItemResultadoNome"),
 
         # Fornecedor vencedor
-        "fornecedor_cnpjCpf":             _s(fornecedor, "cnpjCpf"),
-        "fornecedor_nome":                _s(fornecedor, "nome"),
-        "fornecedor_razaoSocial":         _s(fornecedor, "razaoSocial"),
-        "fornecedor_niFornecedor":        _s(resultado, "niFornecedor"),
-        "fornecedor_tipoPessoa":          _s(resultado, "tipoPessoa"),            # PJ / PF
-        "fornecedor_porteCodigo":         _s(resultado, "porteCodigo"),
-        "fornecedor_porteNome":           _s(resultado, "porteNome"),
-        "fornecedor_paisCodigo":          _s(pais, "codigo"),
-        "fornecedor_paisNome":            _s(pais, "nome"),
+        "fornecedor_cnpjCpf":             _s(resultado, "niFornecedor"),
+        "fornecedor_nome":                _s(resultado, "nomeRazaoSocialFornecedor"),
+        "fornecedor_tipoPessoa":          _s(resultado, "tipoPessoa"),            # PJ / PF / PE
+        "fornecedor_porteCodigo":         _i(resultado, "porteFornecedorId"),
+        "fornecedor_porteNome":           _s(resultado, "porteFornecedorNome"),
+        "fornecedor_naturezaJuridica":    _s(resultado, "naturezaJuridicaNome"),
+        "fornecedor_paisCodigo":          _s(resultado, "codigoPais"),
 
         # Proposta / homologação
-        "resultado_valorUnitarioHomologado":  _f(resultado, "valorUnitarioHomologado"),
-        "resultado_valorTotalHomologado":     _f(resultado, "valorTotalHomologado"),
-        "resultado_quantidadeHomologada":     _f(resultado, "quantidadeHomologada"),
-        "resultado_dataResultado":            _s(resultado, "dataResultado"),
-        "resultado_dataHoraAtualizacao":      _s(resultado, "dataHoraAtualizacao"),
-        "resultado_numeroItemCompra":         _i(resultado, "numeroItemCompra"),
-
-        # Origem do resultado
-        "resultado_orcamentoCodigo":          _s(resultado, "orcamentoCodigo"),
+        "resultado_valorUnitarioHomologado": _f(resultado, "valorUnitarioHomologado"),
+        "resultado_valorTotalHomologado":    _f(resultado, "valorTotalHomologado"),
+        "resultado_quantidadeHomologada":    _f(resultado, "quantidadeHomologada"),
+        "resultado_percentualDesconto":      _f(resultado, "percentualDesconto"),
+        "resultado_dataResultado":           _s(resultado, "dataResultado"),
+        "resultado_dataAtualizacao":         _s(resultado, "dataAtualizacao"),
+        "resultado_dataCancelamento":        _s(resultado, "dataCancelamento"),
     }
 
 
 def montar_linha(contratacao_flat: dict, item_flat: dict, resultado_flat: dict) -> dict:
-    """
-    Combina os três dicionários em uma única linha "plana" para o CSV.
-    Chaves duplicadas: o resultado tem prioridade, depois item, depois contratação.
-    """
-    linha = {}
-    linha.update(contratacao_flat)
-    linha.update(item_flat)
-    linha.update(resultado_flat)
-    return linha
+    """Combina os três dicionários em uma única linha "plana" para o CSV."""
+    return {**contratacao_flat, **item_flat, **resultado_flat}
+
+
+# Colunas saem das próprias funções: um campo novo aparece no CSV sem lista paralela para manter.
+COLUNAS_CSV = list(montar_linha(normalizar_contratacao({}), normalizar_item({}), normalizar_resultado({})))
+
+COLUNAS_SEM_RESULTADO = [
+    "numeroControlePNCP", "anoCompra", "sequencialCompra", "processo",
+    "orgao_cnpj", "orgao_razaoSocial", "unidade_uf", "unidade_municipio",
+    "modalidadeNome", "objetoCompra", "valorTotalEstimado", "valorTotalHomologado",
+    "dataPublicacaoPncp", "linkSistemaOrigem",
+    "motivo_sem_resultado",
+]

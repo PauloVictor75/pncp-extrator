@@ -1,0 +1,53 @@
+{
+ "valorTotalHomologado": 9600.0,
+ "orgaoEntidade": {
+  "cnpj": "91984492000152",
+  "razaoSocial": "MUNICIPIO DE SAO VENDELINO",
+  "poderId": "N",
+  "esferaId": "M"
+ },
+ "dataInclusao": "2026-08-03T00:00:49",
+ "dataAtualizacao": "2026-08-26T15:43:48",
+ "numeroControlePNCP": "91984492000152-1-000082/2026",
+ "anoCompra": 2026,
+ "srp": false,
+ "sequencialCompra": 82,
+ "emendaParlamentar": null,
+ "numeroCompra": "0020",
+ "processo": "0020",
+ "objetoCompra": "AQUISIÇÃO DE ARADO SUBSOLADOR DE 07 (SETE) HASTES, ACOMPANHADO DE KIT DE UNHAS RESERVAS COM PARAFUSOS DE FIXAÇÃO, PARA A SEC. MUN. DA AGRICULTURA. ATRAVÉS DA EMENDA PARLAMENTAR Nº 374/2025, INSERIDA NO ÂMBITO DA AÇÃO PROGRAMÁTICA 0875 – DESENVOLVIMENTO RURAL SUSTENTÁVEL: DIVERSIFICAÇÃO DOS SISTEMAS PRODUTIVOS, GERAÇÃO DE RENDA E SUCESSÃO FAMILIAR NO CAMPO, CONFORME CONSTA NO PROCESSO ADMINISTRATIVO ELETRÔNICO Nº 25/3100-0002029-2.",
+ "informacaoComplementar": "",
+ "dataAberturaProposta": "2026-08-03T09:00:00",
+ "dataEncerramentoProposta": "2026-08-13T09:00:00",
+ "dataPublicacaoPncp": "2026-08-03T00:00:49",
+ "dataAtualizacaoGlobal": "2026-08-26T15:54:39",
+ "unidadeOrgao": {
+  "ufNome": "Rio Grande do Sul",
+  "ufSigla": "RS",
+  "municipioNome": "São Vendelino",
+  "codigoIbge": "4319752",
+  "codigoUnidade": "162873",
+  "nomeUnidade": "MUNICIPIO DE SÃO VENDELINO"
+ },
+ "orgaoSubRogado": null,
+ "unidadeSubRogada": null,
+ "amparoLegal": {
+  "nome": "Lei 14.133/2021, Art. 28, I",
+  "descricao": "pregão: modalidade de licitação obrigatória para aquisição de bens e serviços comuns",
+  "codigo": 1
+ },
+ "linkSistemaOrigem": "https://pregaobanrisul.com.br/editais/0020_2026/354756",
+ "linkProcessoEletronico": null,
+ "justificativaPresencial": null,
+ "valorTotalEstimado": 12740.0,
+ "modalidadeId": 6,
+ "modalidadeNome": "Pregão - Eletrônico",
+ "modoDisputaId": 1,
+ "modoDisputaNome": "Aberto",
+ "tipoInstrumentoConvocatorioCodigo": 1,
+ "tipoInstrumentoConvocatorioNome": "Edital",
+ "fontesOrcamentarias": [],
+ "situacaoCompraId": 1,
+ "situacaoCompraNome": "Divulgada no PNCP",
+ "usuarioNome": "PROCERGS - CENTRO DE TECNOLOGIA DA INFORMACAO E COMUNICACAO DO ESTADO DO RIO GRANDE DO SUL S.A."
+}

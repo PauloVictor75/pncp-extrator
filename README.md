@@ -1,189 +1,116 @@
-# 🏛️ PNCP Extrator — Contratações Homologadas
+# PNCP Extrator
 
-Extração automática de **todas as contratações homologadas e encerradas** do
-[Portal Nacional de Contratações Públicas (PNCP)](https://pncp.gov.br),
-com todos os dados de proposta/resultado por item.
+![testes](https://github.com/PauloVictor75/pncp-extrator/actions/workflows/testes.yml/badge.svg)
 
----
+Extrai do **[PNCP](https://pncp.gov.br)** (Portal Nacional de Contratações Públicas) quem venceu cada item das
+contratações públicas brasileiras e por quanto: órgão comprador, item, fornecedor vencedor (CNPJ/CPF, nome, porte)
+e valores homologados. Saída em CSV pronto para Excel, Power BI ou pandas.
 
-## 📦 O que este sistema extrai
+Usa a API pública e oficial do PNCP — sem navegador, sem CAPTCHA, sem login, uma única dependência (`requests`).
 
-Para cada contratação **Homologada (situação 5)** ou **Encerrada (situação 7)**:
+## Destaques técnicos
 
-| Nível | Dados |
+- **Retomada sem duplicar nem perder dados.** O trabalho é dividido em unidades (janela de 7 dias × modalidade).
+  Cada unidade é gravada inteira ou não é gravada: as linhas vão para arquivos parciais e só entram no CSV final
+  quando a unidade termina. Queda de rede, erro da API ou Ctrl+C no meio → `--retomar` refaz só o que faltou.
+- **Falha não vira "sem dados".** O cliente HTTP distingue "a API não tem nada" (204/404) de "a API falhou"
+  (erro depois das novas tentativas). Uma falha não é registrada como contratação sem resultado: a unidade fica
+  pendente e o programa termina com código 1.
+- **Respeito à API.** Intervalo mínimo entre chamadas, novas tentativas com espera crescente, `Retry-After` no 429.
+- **Menos chamadas.** Itens que a API marca como sem resultado (`temResultado: false`) não geram consulta.
+- **Testado com respostas reais da API** (`tests/fixtures/`), incluindo falha no meio da extração e retomada.
+
+## Como funciona
+
+```
+para cada janela de 7 dias × modalidade:
+    GET /consulta/v1/contratacoes/publicacao   (paginado; a modalidade é obrigatória)
+        para cada contratação:
+            GET /pncp/v1/orgaos/{cnpj}/compras/{ano}/{seq}/itens
+                para cada item com resultado:
+                    GET .../itens/{n}/resultados   →  1 linha por resultado
+```
+
+| Arquivo | O que faz |
 |---|---|
-| **Contratação** | Número PNCP, CNPJ e nome do órgão, UF, município, modalidade, objeto, valor estimado, valor homologado, datas, link de origem |
-| **Item** | Número, descrição, CATMAT/CATSER, critério de julgamento, quantidade, unidade, valor unitário estimado |
-| **Resultado** | Fornecedor vencedor (CNPJ/CPF, nome, porte), valor unitário homologado, valor total homologado, data do resultado |
+| `pncp_client.py` | Cliente da API: intervalo entre chamadas, novas tentativas, tabela de modalidades |
+| `pncp_normalizer.py` | Achata o JSON aninhado em linhas de CSV (nomes de campo conferidos em respostas reais) |
+| `pncp_extrator.py` | Janelas, modalidades, gravação por unidade, retomada e linha de comando |
+| `enriquecimento.py` | Passo opcional: marca e modelo prováveis a partir da descrição do item |
 
-Cada **linha do CSV** = 1 resultado de proposta de 1 item de 1 contratação.
-
----
-
-## ⚡ Início rápido
+## Uso
 
 ```bash
-# 1. Instalar dependências (só 2 pacotes!)
 pip install -r requirements.txt
 
-# 2. Executar com padrão (01/07/2025 até hoje, todos os órgãos)
-python pncp_extrator.py
-
-# 3. Período personalizado
-python pncp_extrator.py --inicio 20250701 --fim 20251231
-
-# 4. Retomar extração interrompida
-python pncp_extrator.py --retomar
+python pncp_extrator.py                                   # últimos 7 dias, todas as modalidades
+python pncp_extrator.py --inicio 20260101 --fim 20260131  # um período
+python pncp_extrator.py --modalidades 6,8                 # só pregão eletrônico e dispensa
+python pncp_extrator.py --retomar                         # continua a extração anterior
+python pncp_extrator.py --help                            # lista os códigos de modalidade
 ```
 
----
+Modalidades: 1 Leilão eletrônico · 2 Diálogo competitivo · 3 Concurso · 4 Concorrência eletrônica ·
+5 Concorrência presencial · 6 Pregão eletrônico · 7 Pregão presencial · 8 Dispensa · 9 Inexigibilidade ·
+10 Manifestação de interesse · 11 Pré-qualificação · 12 Credenciamento · 13 Leilão presencial.
 
-## 🐳 Docker
+**Volume:** o Brasil publica milhares de contratações por dia (só as dispensas passam de 2 mil em dia útil), e
+cada uma pede ao menos duas chamadas à API. Para períodos longos, escolha as modalidades que interessam.
+
+### Docker
 
 ```bash
-# Build
 docker build -t pncp-extrator .
-
-# Executar (saída montada no host)
-docker run -v $(pwd)/saida_pncp:/app/saida_pncp pncp-extrator
-
-# Com período personalizado
-docker run -v $(pwd)/saida_pncp:/app/saida_pncp pncp-extrator \
-    python pncp_extrator.py --inicio 20250701 --fim 20251231
-
-# Retomar
-docker run -v $(pwd)/saida_pncp:/app/saida_pncp pncp-extrator \
-    python pncp_extrator.py --retomar
+docker run --rm -v "$(pwd)/saida_pncp:/app/saida_pncp" pncp-extrator
+docker run --rm -v "$(pwd)/saida_pncp:/app/saida_pncp" pncp-extrator \
+    python pncp_extrator.py --inicio 20260101 --fim 20260131 --modalidades 6
 ```
 
----
+### Marca e modelo (opcional)
 
-## 📁 Arquivos gerados
+A API não informa marca nem modelo. `enriquecimento.py` acrescenta ao CSV as colunas `item_marca_provavel` e
+`item_modelo_provavel`, deduzidas da descrição — palpite, separado dos dados oficiais:
+
+```bash
+python enriquecimento.py saida_pncp/pncp_resultados_X.csv saida_pncp/enriquecido.csv
+```
+
+## Saída
 
 ```
 saida_pncp/
-├── pncp_resultados_YYYYMMDD_HHmmss.csv      ← Dados principais (linha por resultado)
-└── pncp_sem_resultado_YYYYMMDD_HHmmss.csv   ← Contratações sem resultado registrado
-
-pncp_progresso.json   ← Estado de retomada (apagar para recomeçar do zero)
-pncp_extrator.log     ← Log completo da execução
+├── pncp_resultados_AAAAMMDD_HHMMSS.csv     1 linha por resultado de item (fornecedor + valores)
+├── pncp_sem_resultado_AAAAMMDD_HHMMSS.csv  contratações sem resultado registrado, com o motivo
+├── pncp_progresso.json                     ponto de retomada
+└── pncp_extrator.log
 ```
 
-### Separador CSV
-O CSV usa **ponto e vírgula (`;`)** como separador e codificação **UTF-8 com BOM**,
-compatível diretamente com Excel no Brasil.
+CSV com `;` e UTF-8 com BOM (abre direto no Excel brasileiro). Principais colunas:
 
----
-
-## 🗂️ Colunas do CSV principal
-
-### Dados da Contratação
-| Coluna | Descrição |
+| Grupo | Colunas |
 |---|---|
-| `numeroControlePNCP` | Chave única PNCP (ex: `00394494000136-1-000042/2025`) |
-| `anoCompra` / `sequencialCompra` | Ano e sequencial da compra no PNCP |
-| `processo` | Número do processo administrativo |
-| `orgao_cnpj` | CNPJ do órgão comprador |
-| `orgao_razaoSocial` | Nome do órgão |
-| `orgao_poder` | E = Executivo, L = Legislativo, J = Judiciário, M = Ministério Público, D = Defensoria |
-| `orgao_esfera` | F = Federal, E = Estadual, M = Municipal, D = Distrital |
-| `unidade_codigo` | Código da unidade (equivalente ao UASG) |
-| `unidade_nome` | Nome da unidade compradora |
-| `unidade_uf` | Sigla do estado |
-| `unidade_municipio` | Nome do município |
-| `unidade_codigoIBGE` | Código IBGE do município |
-| `modalidadeNome` | Ex: Pregão - Eletrônico, Concorrência |
-| `modoDisputaNome` | Ex: Aberto, Fechado, Aberto e Fechado |
-| `srp` | Sistema de Registro de Preços (true/false) |
-| `situacaoCompraId` | 5 = Homologada, 7 = Encerrada |
-| `situacaoCompraNome` | Nome da situação |
-| `objetoCompra` | Descrição do objeto licitado |
-| `valorTotalEstimado` | Valor total estimado da licitação |
-| `valorTotalHomologado` | Valor total homologado |
-| `dataPublicacaoPncp` | Data de publicação no PNCP |
-| `dataAberturaProposta` | Data/hora de abertura das propostas |
-| `dataEncerramentoProposta` | Data/hora de encerramento |
-| `linkSistemaOrigem` | URL do edital no sistema de origem |
+| Contratação | `numeroControlePNCP`, `orgao_cnpj`, `orgao_razaoSocial`, `unidade_uf`, `unidade_municipio`, `modalidadeNome`, `objetoCompra`, `valorTotalEstimado`, `valorTotalHomologado`, `dataPublicacaoPncp`, `linkSistemaOrigem` |
+| Item | `item_numero`, `item_descricao`, `item_materialServicoNome`, `item_quantidade`, `item_unidadeMedida`, `item_valorUnitarioEstimado`, `item_valorTotalEstimado`, `item_criterioJulgamentoNome` |
+| Resultado | `fornecedor_cnpjCpf`, `fornecedor_nome`, `fornecedor_tipoPessoa`, `fornecedor_porteNome`, `resultado_valorUnitarioHomologado`, `resultado_valorTotalHomologado`, `resultado_quantidadeHomologada`, `resultado_percentualDesconto`, `resultado_dataResultado` |
 
-### Dados do Item
-| Coluna | Descrição |
-|---|---|
-| `item_numero` | Número do item na licitação |
-| `item_descricao` | Descrição do item |
-| `item_materialServico` | M = Material, S = Serviço |
-| `item_criterioJulgamentoNome` | Ex: Menor Preço, Maior Desconto |
-| `item_quantidade` | Quantidade licitada |
-| `item_unidadeMedida` | Unidade (UN, KG, L, etc.) |
-| `item_valorUnitarioEstimado` | Valor unitário estimado |
-| `item_valorTotalEstimado` | Valor total estimado do item |
-| `item_codigoCatalogoCodigo` | Código CATMAT/CATSER |
-| `item_codigoCatalogoNome` | Descrição CATMAT/CATSER |
+A lista completa sai das funções de `pncp_normalizer.py` (`COLUNAS_CSV`).
 
-### Dados do Resultado (Proposta Vencedora)
-| Coluna | Descrição |
-|---|---|
-| `fornecedor_cnpjCpf` | CNPJ ou CPF do fornecedor vencedor |
-| `fornecedor_nome` / `fornecedor_razaoSocial` | Nome do fornecedor |
-| `fornecedor_tipoPessoa` | PJ = Pessoa Jurídica, PF = Pessoa Física |
-| `fornecedor_porteCodigo` / `fornecedor_porteNome` | Porte (ME, EPP, Grande, etc.) |
-| `resultado_valorUnitarioHomologado` | Valor unitário homologado (preço pago) |
-| `resultado_valorTotalHomologado` | Valor total homologado do item |
-| `resultado_quantidadeHomologada` | Quantidade efetivamente homologada |
-| `resultado_dataResultado` | Data do resultado/adjudicação |
+**Situação da contratação:** a listagem do PNCP traz a situação do momento da publicação (quase sempre
+"Divulgada"), não a atual. Por isso o critério é o item ter resultado registrado — o que só acontece depois do
+julgamento.
 
----
+## Testes
 
-## 🔄 Lógica de filtro
-
-A API do PNCP não filtra por situação no endpoint de listagem por período.
-O sistema busca **todas** as contratações do período e filtra em memória:
-
-```
-situacaoCompraId == 5 (Homologada)  ✅ inclui
-situacaoCompraId == 7 (Encerrada)   ✅ inclui
-demais situações                    ❌ descarta
+```bash
+pip install -r requirements-dev.txt
+pytest -q
 ```
 
----
+## Tecnologias
 
-## 📊 Estimativa de volume
-
-Para o período 01/07/2025 a hoje (~9 meses), estimativa:
-- ~50.000–150.000 contratações homologadas no Brasil inteiro
-- ~200.000–500.000 itens
-- ~200.000–500.000 linhas no CSV final
-- Tempo estimado: 2–6 horas (depende da velocidade da API)
+Python 3.11 · requests · pytest · Docker · GitHub Actions
 
 ---
 
-## 🆚 Comparação com o sistema anterior (ComprasNet)
-
-| Item | ComprasNet (antigo) | PNCP (novo) |
-|---|---|---|
-| CAPTCHA | ✅ Obrigatório | ❌ Não existe |
-| Browser (Playwright) | ✅ Necessário | ❌ Não necessário |
-| OCR (EasyOCR/Tesseract) | ✅ Necessário | ❌ Não necessário |
-| Autenticação | N/A | ❌ Não necessária |
-| Formato de dados | ZIP com PDF | JSON estruturado |
-| Dependências Python | ~15 pacotes pesados | 2 pacotes leves |
-| Tamanho da imagem Docker | ~2 GB | ~150 MB |
-| Confiabilidade | ~98% (com CAPTCHA solver) | ~99.9% (API oficial) |
-
----
-
-## ⚙️ Configurações avançadas
-
-Edite as constantes no topo de `pncp_extrator.py`:
-
-```python
-DATA_INICIO_PADRAO  = "20250701"   # data padrão se não passar --inicio
-TAMANHO_PAGINA      = 50           # registros por página (máx 50)
-INTERVALO_DIAS      = 7            # janela de busca em dias
-DELAY_ENTRE_REQ     = 0.4          # segundos entre chamadas (respeito à API)
-```
-
----
-
-## 📄 Licença
-
-MIT — uso livre, incluindo uso comercial e governamental.
+Dados públicos do [Portal Nacional de Contratações Públicas](https://pncp.gov.br). Projeto pessoal, sem vínculo
+com o governo. Licença MIT.

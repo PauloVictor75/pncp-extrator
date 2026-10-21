@@ -2,22 +2,25 @@
 """
 🎯 PNCP EXTRATOR PRINCIPAL
 ===========================
-Extrai do Portal Nacional de Contratações Públicas (pncp.gov.br):
-  • Todas as contratações com situação HOMOLOGADA (5) ou ENCERRADA (7)
-  • Publicadas entre DATA_INICIO e DATA_FIM
-  • Todos os órgãos / UASG do Brasil
-  • Para cada contratação: itens + resultados (proposta vencedora)
-  • Inclui campos de MARCA e MODELO do item
+Extrai do Portal Nacional de Contratações Públicas (pncp.gov.br) os resultados
+(fornecedor vencedor e valores homologados) de cada item das contratações
+publicadas num período, de todos os órgãos do Brasil.
 
-Saída:
+O trabalho é dividido em unidades (janela de dias × modalidade). Cada unidade é
+gravada inteira ou não é gravada: as linhas vão para arquivos parciais e só entram
+nos CSVs finais quando a unidade termina. Assim, uma interrupção ou uma falha da
+API nunca deixa linhas pela metade nem duplicadas — o --retomar refaz só o que faltou.
+
+Saída (pasta saida_pncp/):
   → pncp_resultados_YYYYMMDD_HHmmss.csv    (linha por resultado de item)
   → pncp_sem_resultado_YYYYMMDD_HHmmss.csv (contratações sem resultado)
   → pncp_progresso.json                    (ponto de retomada)
   → pncp_extrator.log                      (log completo)
 
 Uso:
-  python pncp_extrator.py
+  python pncp_extrator.py                                  # últimos 7 dias, todas as modalidades
   python pncp_extrator.py --inicio 20250701 --fim 20251231
+  python pncp_extrator.py --modalidades 6,8                # só pregão eletrônico e dispensa
   python pncp_extrator.py --retomar
 """
 
@@ -25,81 +28,58 @@ import argparse
 import csv
 import json
 import logging
-import os
 import sys
+import shutil
 import time
-from datetime import datetime, timedelta, date
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
-from pncp_client import PNCPClient, SITUACOES_ALVO
+from pncp_client import MODALIDADES, FalhaAPI, PNCPClient
 from pncp_normalizer import (
+    COLUNAS_CSV,
+    COLUNAS_SEM_RESULTADO,
+    montar_linha,
     normalizar_contratacao,
     normalizar_item,
     normalizar_resultado,
-    montar_linha,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configurações padrão
 # ─────────────────────────────────────────────────────────────────────────────
 
-DATA_INICIO_PADRAO  = "20240101"
-TAMANHO_PAGINA      = 50
-INTERVALO_DIAS      = 7
-DELAY_ENTRE_REQ     = 0.4
-ARQUIVO_PROGRESSO   = "pncp_progresso.json"
-ARQUIVO_LOG         = "pncp_extrator.log"
-DIR_SAIDA           = Path("saida_pncp")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────────────────────
-
-def configurar_log():
-    fmt = "%(asctime)s [%(levelname)s] %(message)s"
-    logging.basicConfig(
-        level=logging.INFO,
-        format=fmt,
-        datefmt="%H:%M:%S",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(ARQUIVO_LOG, encoding="utf-8"),
-        ],
-    )
+TAMANHO_PAGINA  = 50     # máximo aceito pela API
+INTERVALO_DIAS  = 7      # tamanho de cada janela de busca
+DELAY_ENTRE_REQ = 0.4    # segundos entre chamadas (respeito à API)
+DIR_SAIDA       = Path("saida_pncp")
 
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Controle de progresso (retomada)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def carregar_progresso() -> dict:
-    if Path(ARQUIVO_PROGRESSO).exists():
-        with open(ARQUIVO_PROGRESSO, encoding="utf-8") as f:
-            prog = json.load(f)
-        logger.info(f"📂 Progresso anterior carregado: {prog.get('ultima_data_processada')} | "
-                    f"{prog.get('total_contratacoes', 0)} contratações | "
-                    f"{prog.get('total_resultados', 0)} resultados")
-        return prog
-    return {}
-
-
-def salvar_progresso(prog: dict):
-    prog["timestamp_atualizacao"] = datetime.now().isoformat()
-    with open(ARQUIVO_PROGRESSO, "w", encoding="utf-8") as f:
-        json.dump(prog, f, ensure_ascii=False, indent=2)
+def configurar_log(pasta: Path):
+    pasta.mkdir(parents=True, exist_ok=True)
+    if hasattr(sys.stdout, "reconfigure"):   # terminal do Windows (cp1252) não mostra os emojis do log
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(pasta / "pncp_extrator.log", encoding="utf-8"),
+        ],
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Geração de janelas de datas
+# Janelas de datas
 # ─────────────────────────────────────────────────────────────────────────────
 
 def gerar_janelas(data_inicio: str, data_fim: str, intervalo_dias: int = INTERVALO_DIAS):
     d_ini = datetime.strptime(data_inicio, "%Y%m%d").date()
-    d_fim = datetime.strptime(data_fim,    "%Y%m%d").date()
+    d_fim = datetime.strptime(data_fim, "%Y%m%d").date()
+    if d_ini > d_fim:
+        raise ValueError(f"Início {data_inicio} depois do fim {data_fim}.")
 
     janelas = []
     cursor = d_ini
@@ -107,133 +87,60 @@ def gerar_janelas(data_inicio: str, data_fim: str, intervalo_dias: int = INTERVA
         fim_janela = min(cursor + timedelta(days=intervalo_dias - 1), d_fim)
         janelas.append((cursor.strftime("%Y%m%d"), fim_janela.strftime("%Y%m%d")))
         cursor = fim_janela + timedelta(days=1)
-
     return janelas
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Colunas do CSV — inclui item_marca e item_modelo
-# ─────────────────────────────────────────────────────────────────────────────
-
-COLUNAS_CSV = [
-    # ── Contratação ──────────────────────────────────────────────────────────
-    "numeroControlePNCP",
-    "anoCompra",
-    "sequencialCompra",
-    "processo",
-    "orgao_cnpj",
-    "orgao_razaoSocial",
-    "orgao_poder",
-    "orgao_esfera",
-    "unidade_codigo",
-    "unidade_nome",
-    "unidade_uf",
-    "unidade_municipio",
-    "unidade_codigoIBGE",
-    "orgaoSubRogado_cnpj",
-    "orgaoSubRogado_razaoSocial",
-    "unidadeSubRogada_codigo",
-    "unidadeSubRogada_nome",
-    "modalidadeId",
-    "modalidadeNome",
-    "modoDisputaId",
-    "modoDisputaNome",
-    "tipoInstrumentoConvocatorioCod",
-    "tipoInstrumentoConvocatorioNom",
-    "srp",
-    "situacaoCompraId",
-    "situacaoCompraNome",
-    "objetoCompra",
-    "informacaoComplementar",
-    "valorTotalEstimado",
-    "valorTotalHomologado",
-    "dataPublicacaoPncp",
-    "dataAberturaProposta",
-    "dataEncerramentoProposta",
-    "dataInclusao",
-    "dataAtualizacao",
-    "linkSistemaOrigem",
-    "usuarioNome",
-    # ── Item ─────────────────────────────────────────────────────────────────
-    "item_numero",
-    "item_descricao",
-    "item_materialServico",
-    "item_materialServicoNome",
-    "item_tipoBeneficio",
-    "item_tipoBeneficioNome",
-    "item_situacaoCodigo",
-    "item_situacaoNome",
-    "item_criterioJulgamentoCodigo",
-    "item_criterioJulgamentoNome",
-    "item_quantidade",
-    "item_unidadeMedida",
-    "item_valorUnitarioEstimado",
-    "item_valorTotalEstimado",
-    "item_orcamentoSigiloso",
-    "item_ncmNbs",
-    "item_codigoCatalogoCodigo",
-    "item_codigoCatalogoNome",
-    "item_marca",            # ← marca do fabricante (marcaFabricante)
-    "item_modelo",           # ← modelo / versão (modeloVersao)
-    # ── Resultado / Proposta vencedora ───────────────────────────────────────
-    "resultado_sequencial",
-    "resultado_situacaoCodigo",
-    "resultado_situacaoNome",
-    "fornecedor_cnpjCpf",
-    "fornecedor_nome",
-    "fornecedor_razaoSocial",
-    "fornecedor_niFornecedor",
-    "fornecedor_tipoPessoa",
-    "fornecedor_porteCodigo",
-    "fornecedor_porteNome",
-    "fornecedor_paisCodigo",
-    "fornecedor_paisNome",
-    "resultado_valorUnitarioHomologado",
-    "resultado_valorTotalHomologado",
-    "resultado_quantidadeHomologada",
-    "resultado_dataResultado",
-    "resultado_dataHoraAtualizacao",
-    "resultado_numeroItemCompra",
-    "resultado_orcamentoCodigo",
-]
-
-COLUNAS_SEM_RESULTADO = [
-    "numeroControlePNCP", "anoCompra", "sequencialCompra", "processo",
-    "orgao_cnpj", "orgao_razaoSocial", "unidade_uf", "unidade_municipio",
-    "modalidadeNome", "situacaoCompraId", "situacaoCompraNome",
-    "objetoCompra", "valorTotalEstimado", "valorTotalHomologado",
-    "dataPublicacaoPncp", "linkSistemaOrigem",
-    "motivo_sem_resultado",
-]
+def chave_unidade(d_ini: str, d_fim: str, modalidade: int) -> str:
+    return f"{d_ini}_{d_fim}_m{modalidade}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Escrita CSV
 # ─────────────────────────────────────────────────────────────────────────────
 
-class EscritorCSV:
-    """Abre / reabre CSVs em modo append, escrevendo cabeçalho só na primeira vez."""
+class ParcialCSV:
+    """CSV sem cabeçalho de uma unidade em andamento; só vai para o final se a unidade terminar."""
 
     def __init__(self, caminho: Path, colunas: list):
         self.caminho = caminho
         self.colunas = colunas
-        self._escreve_cabecalho = not caminho.exists()
-        self._fh = open(caminho, "a", newline="", encoding="utf-8-sig")
-        self._writer = csv.DictWriter(
-            self._fh, fieldnames=colunas, extrasaction="ignore", delimiter=";"
-        )
-        if self._escreve_cabecalho:
-            self._writer.writeheader()
-            self._fh.flush()
+        self.linhas = 0
+        self._fh = open(caminho, "w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._fh, fieldnames=colunas, extrasaction="ignore", delimiter=";")
 
     def escrever(self, linha: dict):
         self._writer.writerow(linha)
+        self.linhas += 1
 
-    def flush(self):
-        self._fh.flush()
-
-    def close(self):
+    def acrescentar_em(self, destino: Path):
+        """Copia as linhas para o CSV final (cabeçalho e BOM só quando ele é novo)."""
         self._fh.close()
+        if self.linhas:
+            novo = not destino.exists()
+            with open(destino, "a", newline="", encoding="utf-8-sig" if novo else "utf-8") as saida:
+                if novo:
+                    csv.writer(saida, delimiter=";").writerow(self.colunas)
+                with open(self.caminho, encoding="utf-8", newline="") as origem:
+                    shutil.copyfileobj(origem, saida)
+        self.caminho.unlink()
+
+    def descartar(self):
+        self._fh.close()
+        self.caminho.unlink(missing_ok=True)
+
+
+class Unidade:
+    """Uma janela × modalidade: as linhas ficam em arquivos parciais até ela terminar."""
+
+    def __init__(self, pasta: Path):
+        self.resultados = ParcialCSV(pasta / "parcial_resultados.csv", COLUNAS_CSV)
+        self.sem_resultado = ParcialCSV(pasta / "parcial_sem_resultado.csv", COLUNAS_SEM_RESULTADO)
+        self.contratacoes = 0
+        self.itens = 0
+
+    def descartar(self):
+        self.resultados.descartar()
+        self.sem_resultado.descartar()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -242,206 +149,176 @@ class EscritorCSV:
 
 class PNCPExtrator:
 
-    def __init__(self, data_inicio: str, data_fim: str, retomar: bool = False):
+    def __init__(self, data_inicio: str, data_fim: str, modalidades: list,
+                 pasta: Path = DIR_SAIDA, retomar: bool = False, client=None):
+        self.pasta = pasta
+        self.pasta.mkdir(parents=True, exist_ok=True)
+        self.arquivo_progresso = pasta / "pncp_progresso.json"
+        self.client = client or PNCPClient(delay_entre_req=DELAY_ENTRE_REQ)
+
+        self.progresso = self._carregar_progresso() if retomar else {}
+        if self.progresso:
+            # retomar continua exatamente a extração anterior
+            data_inicio = self.progresso["inicio"]
+            data_fim = self.progresso["fim"]
+            modalidades = self.progresso["modalidades"]
+        else:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.progresso = {
+                "inicio": data_inicio,
+                "fim": data_fim,
+                "modalidades": modalidades,
+                "arquivo_resultados": f"pncp_resultados_{ts}.csv",
+                "arquivo_sem_resultado": f"pncp_sem_resultado_{ts}.csv",
+                "unidades_concluidas": [],
+                "totais": {"contratacoes": 0, "itens": 0, "resultados": 0, "sem_resultado": 0},
+            }
         self.data_inicio = data_inicio
-        self.data_fim    = data_fim
-        self.client      = PNCPClient(delay_entre_req=DELAY_ENTRE_REQ)
-        self.progresso   = carregar_progresso() if retomar else {}
-
-        DIR_SAIDA.mkdir(exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.csv_resultados    = EscritorCSV(DIR_SAIDA / f"pncp_resultados_{ts}.csv",    COLUNAS_CSV)
-        self.csv_sem_resultado = EscritorCSV(DIR_SAIDA / f"pncp_sem_resultado_{ts}.csv", COLUNAS_SEM_RESULTADO)
-
-        # Contadores
-        self.total_contratacoes = self.progresso.get("total_contratacoes", 0)
-        self.total_filtradas    = self.progresso.get("total_filtradas", 0)
-        self.total_itens        = self.progresso.get("total_itens", 0)
-        self.total_resultados   = self.progresso.get("total_resultados", 0)
-        self.total_sem_result   = self.progresso.get("total_sem_resultado", 0)
-        self.inicio_execucao    = time.time()
-
-    # ── Controle de progresso ─────────────────────────────────────────────────
-
-    def _ja_processou_janela(self, data_ini: str, data_fim: str) -> bool:
-        janelas_ok = self.progresso.get("janelas_concluidas", [])
-        return f"{data_ini}_{data_fim}" in janelas_ok
-
-    def _marcar_janela_concluida(self, data_ini: str, data_fim: str):
-        janelas_ok = self.progresso.setdefault("janelas_concluidas", [])
-        chave = f"{data_ini}_{data_fim}"
-        if chave not in janelas_ok:
-            janelas_ok.append(chave)
-
-    # ── Processamento de uma contratação ─────────────────────────────────────
-
-    def processar_contratacao(self, contratacao: dict):
-        """Processa itens + resultados de uma contratação já filtrada."""
-        cnpj      = (contratacao.get("orgaoEntidade") or {}).get("cnpj", "")
-        ano       = contratacao.get("anoCompra")
-        seq       = contratacao.get("sequencialCompra")
-        ctrl_pncp = contratacao.get("numeroControlePNCP", "?")
-
-        if not cnpj or not ano or not seq:
-            logger.warning(f"  ⚠ Contratação sem cnpj/ano/seq: {ctrl_pncp}")
-            return
-
-        c_flat = normalizar_contratacao(contratacao)
-
-        # 1. Buscar itens
-        itens = self.client.listar_itens_compra(cnpj, ano, seq)
-        if not itens:
-            logger.debug(f"  — Sem itens: {ctrl_pncp}")
-            c_flat["motivo_sem_resultado"] = "sem_itens"
-            self.csv_sem_resultado.escrever(c_flat)
-            self.total_sem_result += 1
-            return
-
-        teve_resultado = False
-
-        for item in itens:
-            i_flat   = normalizar_item(item)   # inclui item_marca e item_modelo
-            num_item = item.get("numeroItem")
-            if num_item is None:
-                continue
-
-            self.total_itens += 1
-
-            # 2. Buscar resultados do item
-            resultados = self.client.listar_resultados_item(cnpj, ano, seq, num_item)
-
-            if not resultados:
-                continue
-
-            for resultado in resultados:
-                r_flat = normalizar_resultado(resultado)
-                linha  = montar_linha(c_flat, i_flat, r_flat)
-                self.csv_resultados.escrever(linha)
-                self.total_resultados += 1
-                teve_resultado = True
-
-        if not teve_resultado:
-            c_flat["motivo_sem_resultado"] = "itens_sem_resultado"
-            self.csv_sem_resultado.escrever(c_flat)
-            self.total_sem_result += 1
-
-    # ── Processamento de uma janela temporal ─────────────────────────────────
-
-    def processar_janela(self, data_ini: str, data_fim: str):
-        """Busca e filtra todas as contratações de uma janela temporal."""
-        pagina        = 1
-        total_paginas = 1
-
-        logger.info(f"📅 Janela: {data_ini} → {data_fim}")
-
-        while pagina <= total_paginas:
-            resp = self.client.listar_contratacoes_publicacao(
-                data_ini, data_fim, pagina=pagina, tamanho=TAMANHO_PAGINA
-            )
-
-            if not resp:
-                logger.warning(f"  ⚠ Sem resposta na página {pagina}")
-                break
-
-            dados         = resp.get("data") or []
-            total_reg     = resp.get("totalRegistros", 0)
-            total_paginas = resp.get("totalPaginas", 1)
-
-            if pagina == 1:
-                logger.info(f"  📊 {total_reg} contratações nesta janela ({total_paginas} páginas)")
-
-            for contratacao in dados:
-                self.total_contratacoes += 1
-
-                # ℹ️  O endpoint /publicacao sempre retorna situacaoCompraId=1
-                # (situação no momento da publicação, não a situação atual).
-                # Por isso NÃO filtramos aqui — processamos todas as contratações
-                # e deixamos o filtro natural acontecer nos itens/resultados:
-                # se o item foi homologado, o endpoint de resultados retorna dados;
-                # se não foi, retorna vazio e vai para csv_sem_resultado.
-
-                self.total_filtradas += 1
-                ctrl = contratacao.get("numeroControlePNCP", "?")
-                sit  = contratacao.get("situacaoCompraNome", "?")
-                logger.debug(f"  → [{self.total_filtradas}] {ctrl} | {sit}")
-
-                self.processar_contratacao(contratacao)
-
-                # Flush e salvamento de progresso a cada 20 contratações filtradas
-                if self.total_filtradas % 20 == 0:
-                    self.csv_resultados.flush()
-                    self.csv_sem_resultado.flush()
-                    self._salvar_progresso_parcial(data_ini, data_fim)
-
-            pagina += 1
+        self.data_fim = data_fim
+        self.modalidades = modalidades
+        self.csv_resultados = pasta / self.progresso["arquivo_resultados"]
+        self.csv_sem_resultado = pasta / self.progresso["arquivo_sem_resultado"]
+        self.falhas = []
 
     # ── Progresso ────────────────────────────────────────────────────────────
 
-    def _salvar_progresso_parcial(self, data_ini: str = "", data_fim: str = ""):
-        elapsed = time.time() - self.inicio_execucao
-        self.progresso.update({
-            "ultima_data_processada": f"{data_ini}_{data_fim}",
-            "total_contratacoes":     self.total_contratacoes,
-            "total_filtradas":        self.total_filtradas,
-            "total_itens":            self.total_itens,
-            "total_resultados":       self.total_resultados,
-            "total_sem_resultado":    self.total_sem_result,
-            "tempo_decorrido_s":      round(elapsed, 1),
-        })
-        salvar_progresso(self.progresso)
+    def _carregar_progresso(self) -> dict:
+        if not self.arquivo_progresso.exists():
+            logger.warning("Nada para retomar: começando do zero.")
+            return {}
+        prog = json.loads(self.arquivo_progresso.read_text(encoding="utf-8"))
+        logger.info(f"📂 Retomando: {prog['inicio']} → {prog['fim']}, "
+                    f"{len(prog['unidades_concluidas'])} unidades já concluídas")
+        return prog
+
+    def _salvar_progresso(self):
+        self.progresso["atualizado_em"] = datetime.now().isoformat(timespec="seconds")
+        temporario = self.arquivo_progresso.with_suffix(".tmp")
+        temporario.write_text(json.dumps(self.progresso, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporario.replace(self.arquivo_progresso)
+
+    # ── Uma contratação ──────────────────────────────────────────────────────
+
+    def processar_contratacao(self, contratacao: dict, unidade: Unidade):
+        """Itens + resultados de uma contratação. FalhaAPI sobe e derruba a unidade."""
+        cnpj = (contratacao.get("orgaoEntidade") or {}).get("cnpj", "")
+        ano = contratacao.get("anoCompra")
+        seq = contratacao.get("sequencialCompra")
+        unidade.contratacoes += 1
+        c_flat = normalizar_contratacao(contratacao)
+
+        if not cnpj or not ano or not seq:
+            unidade.sem_resultado.escrever({**c_flat, "motivo_sem_resultado": "sem_identificacao"})
+            return
+
+        itens = self.client.listar_itens_compra(cnpj, ano, seq)
+        if not itens:
+            unidade.sem_resultado.escrever({**c_flat, "motivo_sem_resultado": "sem_itens"})
+            return
+
+        teve_resultado = False
+        for item in itens:
+            num_item = item.get("numeroItem")
+            if num_item is None:
+                continue
+            unidade.itens += 1
+            # a API avisa se o item tem resultado: evita uma chamada por item sem vencedor
+            if item.get("temResultado") is False:
+                continue
+            i_flat = normalizar_item(item)
+            for resultado in self.client.listar_resultados_item(cnpj, ano, seq, num_item):
+                unidade.resultados.escrever(montar_linha(c_flat, i_flat, normalizar_resultado(resultado)))
+                teve_resultado = True
+
+        if not teve_resultado:
+            unidade.sem_resultado.escrever({**c_flat, "motivo_sem_resultado": "itens_sem_resultado"})
+
+    # ── Uma unidade (janela × modalidade) ────────────────────────────────────
+
+    def processar_unidade(self, d_ini: str, d_fim: str, modalidade: int) -> Unidade:
+        unidade = Unidade(self.pasta)
+        try:
+            self._ler_paginas(d_ini, d_fim, modalidade, unidade)
+        except BaseException:
+            unidade.descartar()   # falha da API ou Ctrl+C: nada desta unidade entra nos CSVs
+            raise
+        return unidade
+
+    def _ler_paginas(self, d_ini: str, d_fim: str, modalidade: int, unidade: Unidade):
+        pagina, total_paginas = 1, 1
+        while pagina <= total_paginas:
+            resp = self.client.listar_contratacoes_publicacao(
+                d_ini, d_fim, modalidade, pagina=pagina, tamanho=TAMANHO_PAGINA
+            )
+            total_paginas = resp.get("totalPaginas") or 0
+            if pagina == 1 and total_paginas:
+                logger.info(f"   {MODALIDADES.get(modalidade, modalidade)}: "
+                            f"{resp.get('totalRegistros', 0)} contratações ({total_paginas} páginas)")
+            for contratacao in resp.get("data") or []:
+                self.processar_contratacao(contratacao, unidade)
+            pagina += 1
+
+    def _gravar_unidade(self, chave: str, unidade: Unidade):
+        """Só aqui as linhas entram nos CSVs finais — e logo depois a unidade vira concluída."""
+        n_resultados, n_sem = unidade.resultados.linhas, unidade.sem_resultado.linhas
+        unidade.resultados.acrescentar_em(self.csv_resultados)
+        unidade.sem_resultado.acrescentar_em(self.csv_sem_resultado)
+        totais = self.progresso["totais"]
+        totais["contratacoes"] += unidade.contratacoes
+        totais["itens"] += unidade.itens
+        totais["resultados"] += n_resultados
+        totais["sem_resultado"] += n_sem
+        self.progresso["unidades_concluidas"].append(chave)
+        self._salvar_progresso()
 
     # ── Execução principal ───────────────────────────────────────────────────
 
-    def executar(self):
-        janelas       = gerar_janelas(self.data_inicio, self.data_fim)
-        total_janelas = len(janelas)
+    def executar(self) -> int:
+        """0 = tudo extraído; 1 = alguma unidade falhou (rode de novo com --retomar)."""
+        inicio = time.time()
+        janelas = gerar_janelas(self.data_inicio, self.data_fim)
+        unidades = [(d_ini, d_fim, m) for d_ini, d_fim in janelas for m in self.modalidades]
+        concluidas = set(self.progresso["unidades_concluidas"])
 
         logger.info("=" * 65)
-        logger.info("🚀 PNCP EXTRATOR — INÍCIO")
+        logger.info("🚀 PNCP EXTRATOR")
         logger.info(f"   Período:     {self.data_inicio} → {self.data_fim}")
-        logger.info(f"   Situações:   Homologada (5) e Encerrada (7)")
-        logger.info(f"   Janelas:     {total_janelas} ({INTERVALO_DIAS} dias cada)")
-        logger.info(f"   Campos:      marca e modelo incluídos")
-        logger.info(f"   Saída:       {DIR_SAIDA.resolve()}")
+        logger.info(f"   Modalidades: {', '.join(str(m) for m in self.modalidades)}")
+        logger.info(f"   Unidades:    {len(unidades)} ({len(janelas)} janelas × {len(self.modalidades)} modalidades)")
+        logger.info(f"   Saída:       {self.pasta.resolve()}")
         logger.info("=" * 65)
+        self._salvar_progresso()
 
-        try:
-            for idx, (d_ini, d_fim) in enumerate(janelas, 1):
-                if self._ja_processou_janela(d_ini, d_fim):
-                    logger.info(f"⏭  Janela {idx}/{total_janelas} já processada, pulando.")
-                    continue
+        for idx, (d_ini, d_fim, modalidade) in enumerate(unidades, 1):
+            chave = chave_unidade(d_ini, d_fim, modalidade)
+            if chave in concluidas:
+                continue
+            logger.info(f"🔄 [{idx}/{len(unidades)}] {d_ini} → {d_fim}, modalidade {modalidade}")
+            try:
+                unidade = self.processar_unidade(d_ini, d_fim, modalidade)
+            except KeyboardInterrupt:
+                logger.warning("⏹ Interrompido. O que já foi gravado fica; continue com --retomar.")
+                return 130
+            except FalhaAPI as erro:
+                logger.error(f"   ❌ Unidade não gravada ({erro}). Rode de novo com --retomar.")
+                self.falhas.append(chave)
+                continue
+            self._gravar_unidade(chave, unidade)
 
-                logger.info(f"\n🔄 Janela {idx}/{total_janelas}")
-                self.processar_janela(d_ini, d_fim)
-                self._marcar_janela_concluida(d_ini, d_fim)
-                self._salvar_progresso_parcial(d_ini, d_fim)
+        self._imprimir_resumo(time.time() - inicio)
+        return 1 if self.falhas else 0
 
-                elapsed = time.time() - self.inicio_execucao
-                logger.info(
-                    f"   ↳ Parcial: {self.total_filtradas} filtradas | "
-                    f"{self.total_resultados} resultados | "
-                    f"{elapsed/60:.1f} min"
-                )
-
-        finally:
-            self.csv_resultados.close()
-            self.csv_sem_resultado.close()
-            self._salvar_progresso_parcial()
-            self._imprimir_resumo_final()
-
-    # ── Resumo final ─────────────────────────────────────────────────────────
-
-    def _imprimir_resumo_final(self):
-        elapsed = time.time() - self.inicio_execucao
-        logger.info("\n" + "=" * 65)
-        logger.info("🏁 EXTRAÇÃO CONCLUÍDA")
-        logger.info(f"   Contratações lidas:     {self.total_contratacoes:,}")
-        logger.info(f"   Filtradas (hom+enc):    {self.total_filtradas:,}")
-        logger.info(f"   Itens processados:      {self.total_itens:,}")
-        logger.info(f"   Resultados gravados:    {self.total_resultados:,}")
-        logger.info(f"   Sem resultado:          {self.total_sem_result:,}")
-        logger.info(f"   Tempo total:            {elapsed/60:.1f} min")
-        logger.info(f"   Arquivos em:            {DIR_SAIDA.resolve()}")
+    def _imprimir_resumo(self, segundos: float):
+        t = self.progresso["totais"]
+        logger.info("=" * 65)
+        logger.info("🏁 EXTRAÇÃO " + ("INCOMPLETA" if self.falhas else "CONCLUÍDA"))
+        logger.info(f"   Contratações lidas:   {t['contratacoes']:,}")
+        logger.info(f"   Itens:                {t['itens']:,}")
+        logger.info(f"   Resultados gravados:  {t['resultados']:,}")
+        logger.info(f"   Sem resultado:        {t['sem_resultado']:,}")
+        logger.info(f"   Tempo desta execução: {segundos / 60:.1f} min")
+        if self.falhas:
+            logger.info(f"   Unidades com falha:   {len(self.falhas)} → python pncp_extrator.py --retomar")
         logger.info("=" * 65)
 
 
@@ -449,35 +326,38 @@ class PNCPExtrator:
 # Ponto de entrada
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main():
-    configurar_log()
+def _data(valor: str) -> str:
+    datetime.strptime(valor, "%Y%m%d")  # valida
+    return valor
 
-    parser = argparse.ArgumentParser(
-        description="Extrai contratações homologadas/encerradas do PNCP."
-    )
-    parser.add_argument(
-        "--inicio", default=DATA_INICIO_PADRAO,
-        help="Data de início (YYYYMMDD). Padrão: 20240101"
-    )
-    parser.add_argument(
-        "--fim", default=date.today().strftime("%Y%m%d"),
-        help="Data de fim (YYYYMMDD). Padrão: hoje"
-    )
-    parser.add_argument(
-        "--retomar", action="store_true",
-        help="Retoma extração anterior usando pncp_progresso.json"
-    )
-    args = parser.parse_args()
 
-    logger.info(f"▶ Parâmetros: inicio={args.inicio} | fim={args.fim} | retomar={args.retomar}")
+def _modalidades(valor: str) -> list:
+    codigos = sorted({int(v) for v in valor.split(",") if v.strip()})
+    invalidos = [c for c in codigos if c not in MODALIDADES]
+    if invalidos or not codigos:
+        raise argparse.ArgumentTypeError(f"modalidades válidas: {', '.join(map(str, MODALIDADES))}")
+    return codigos
 
-    extrator = PNCPExtrator(
-        data_inicio=args.inicio,
-        data_fim=args.fim,
-        retomar=args.retomar,
-    )
-    extrator.executar()
+
+def main(argv=None) -> int:
+    ontem = date.today() - timedelta(days=1)
+    parser = argparse.ArgumentParser(description="Extrai os resultados das contratações do PNCP.")
+    parser.add_argument("--inicio", type=_data, default=(ontem - timedelta(days=6)).strftime("%Y%m%d"),
+                        help="data de início AAAAMMDD (padrão: 7 dias atrás)")
+    parser.add_argument("--fim", type=_data, default=ontem.strftime("%Y%m%d"),
+                        help="data de fim AAAAMMDD (padrão: ontem)")
+    parser.add_argument("--modalidades", type=_modalidades, default=list(MODALIDADES),
+                        help="códigos separados por vírgula (padrão: todas). "
+                             + "; ".join(f"{c}={n}" for c, n in MODALIDADES.items()))
+    parser.add_argument("--saida", type=Path, default=DIR_SAIDA, help="pasta de saída (padrão: saida_pncp)")
+    parser.add_argument("--retomar", action="store_true",
+                        help="continua a extração anterior (mesmo período, modalidades e arquivos)")
+    args = parser.parse_args(argv)
+
+    configurar_log(args.saida)
+    extrator = PNCPExtrator(args.inicio, args.fim, args.modalidades, pasta=args.saida, retomar=args.retomar)
+    return extrator.executar()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

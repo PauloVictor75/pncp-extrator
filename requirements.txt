@@ -1,5 +1,1 @@
-# PNCP Extrator — dependências
-# Instalar: pip install -r requirements.txt
-
-requests>=2.31.0       # HTTP client com retry e sessão
-tqdm>=4.66.0           # barra de progresso opcional
+requests>=2.31,<3
